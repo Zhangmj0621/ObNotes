@@ -1,0 +1,1 @@
+相比于前文讨论，具体的sglang 调用kvcache传输接口后如何下送到底层的Mooncake Transfer Engine，本文主要探讨，prefill与decode是如何协调要发送的kvcache大小，提前分配的内存地址等等；

@@ -1,0 +1,3 @@
+目前仍然首先在RolloutManager中的run_dataloader(...)中，其中调用DataCoordinator中的run_dataloader_single_sample(...)不断获取单个sample，对其做预处理；
+其中，对于引入SampleGroup后，首先记录该原始prompt的uid，对其创建Samplegroup后记录到self.\_pending\_groups中，并且，在此处直接将sample复制rollout_n份，并记录其对应的replica_index，将这些复制后的sample统一丢入self.pending_queue中，用于等待RolloutManager中的prefetch_data(..)线程来按照顺序将其放入dataloader_queue中；
+针对partial rollout的具体生效，则是在DataCoordinator中新增self.\_cancel\_queue，在NaiveExecutor的get_sample中，每次优先从cancel_queue中获取sample，无sample可获取时，才从dataloader_queue中获取；

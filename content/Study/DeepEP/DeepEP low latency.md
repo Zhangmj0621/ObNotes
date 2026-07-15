@@ -1,0 +1,1 @@
+DeepEP low latency的主要实现在internode_ll.cu文件中，其中主要实现了dispatch和combine两个kernel函数，首先需要注意的是，DeepEP low latency与normal kernel不同，在发送时并不仅依靠同号GPU建联，而是直接走RDMA通信（可类似理解为PXN的概念）
