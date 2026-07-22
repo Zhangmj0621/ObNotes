@@ -328,7 +328,7 @@ def _insert_helper(
 ```
 随后查看evict的具体逻辑，具体函数如下，其中，首先创建tracker记录每个不同的tree component的访问次数，随后，针对不同的tree_component，调用drive_evcition函数，其中`drive_eviction(...)`分别从不同的component池中evict来释放空间，EvictParams 里分别带 num_tokens / swa_num_tokens / mamba_num，其中，full的evict仍然是经典的从evictable_leaves中不断按照优先级选取leaf进行evict，调用`_evict_device_leaf(...)`函数，该函数核心做如下操作：
 1. Full：若没备份，判断是否是backup，若是，先write_backup，writing_check没问题后，在调用_evict_to_host(...)，若非backup，则直接调用`_evict_component_and_detach_lru(...)`函数，对于Full而言，该函数不做任何操作；
-2. SWA/mamba：相比于Full，调用_evict_device_leaf(...)的时机完全不一样，扫描的顺序是从LRU的尾部开始往前扫，注意，只对叶子结点调用_evict_device_leaf(...)，对于非叶子结点，直接调用`_evict_component_and_detach_lru(...)`函数时，其中调用`evict_component(...)`释放自己的池子槽位，后续会调用_iteratively_delete_tombstone_leaf(...)来递归删除墓碑节点，
+2. SWA/mamba：相比于Full，调用_evict_device_leaf(...)的时机完全不一样，扫描的顺序是从LRU的尾部开始往前扫，注意，只对叶子结点调用_evict_device_leaf(...)，对于非叶子结点，直接调用`_evict_component_and_detach_lru(...)`函数时，其中调用`evict_component(...)`释放自己的池子槽位，后续会调用`_iteratively_delete_tombstone_leaf(...)`来递归删除墓碑节点，
 ```py title="evict"
 def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
@@ -352,11 +352,57 @@ def evict(self, params: EvictParams) -> EvictResult:
             mamba_num_evicted=tracker.get(ComponentType.MAMBA, 0),
         )
 ```
+其中详细解释下不同的tree_component的`drive_eviction`，函数，对于Full而言，非常简单，按照优先级拿到不同的leaves，随后，直接调用不同的_evict_device_leaf(...)函数；而对于SWA/mamba则不一样，按照LRUlist的顺序进行evict，核心参考last_access_time，而且insert插入时，采用mru方式，会保证链表按照child->parent->grand_parent的顺序在双链表中，因而在evict从后向前时，会优先evict parent节点的SWA kv，随后再是child，这也符合SWA的算法特性，最近窗口的KV才有用，因此优先evict parent的SWA KV，然而，这显然没考虑到session_ref，evict时应该按照session_ref来evict，而不是无脑mru，可以作为后续SessionUnifiedRadixCacheMixin的设计原则；当然设计的时候，应当为每个不同的component额外维护自己的ref，在不同的component分别实现各自的session计数维护方法，并在SessionUnfiedradixCacheMixin中封装调用，这样在UnifiedRadixCache层面所有session相关的函数能优先包装到mixin中；
+其中`_evict_component`实际上替换的是调用不同的kv_pool的free来释放不同的KV space，把不同的LRU list中的node给删除，这就是_evict_component_and_detach_lru;
+```py title="\_evict_component_and_detach_lru"
+def _evict_component_and_detach_lru(
+        self,
+        node: UnifiedTreeNode,
+        comp: TreeComponent,
+        target: EvictLayer = EvictLayer.DEVICE,
+        tracker: Optional[dict[ComponentType, int]] = None,
+    ) -> tuple[int, int]:
+        device_freed, host_freed = comp.evict_component(node, target=target)
+        if tracker is not None:
+            if EvictLayer.DEVICE in target:
+                tracker[comp.component_type] += device_freed
+            elif EvictLayer.HOST in target:
+                tracker[comp.component_type] += host_freed
 
+        # Detach from the appropriate LRU list(s)
+        ct = comp.component_type
+        for layer, lru_lists in (
+            (EvictLayer.DEVICE, self.lru_lists),
+            (EvictLayer.HOST, self.host_lru_lists),
+        ):
+            if layer in target:
+                lru = lru_lists[ct]
+                if lru.in_list(node):
+                    lru.remove_node(node)
+        return device_freed, host_freed
+```
+在evict_device_leaf中，如果是write_through模式，还会调用`_iteratively_delete_tombstone_leaf(...)`来递归删除节点，其中的核心逻辑是：
+* 若改node的父亲还有任何的部分还咋被使用，则不允许evict；
+* 随后判断该节点的父亲的device是否在HBM中，如果在的话，直接break，不然证明该parent的full已经被evict，那就把别的component也给evict了，如果host_value也不在了，把host伤的别的component也都evict了，此时证明该node已经没用了，将其中各个component都分别调用`_evict_component_and_detach_lru(...)`来进行evict component，随后，如果device和host的full KV都不在了，直接调用`_remove_leaf_from_parent(...)`，将其从树中删除，否则，保留该节点，这也为后续出现可能一个node不存在device value，但是存在SWA/Mamba提供可能性；
+其中关注下_evict_to_host(...)函数，在write_through策略下，假设node节点被backup了，则会走这个函数，具体的代码如下，
+```py title="evict_to_host"
+def _evict_to_host(
+        self, node: UnifiedTreeNode, tracker: Optional[dict[ComponentType, int]] = None
+    ) -> None:
+        """GPU→CPU demotion: release all device resources, node stays in tree."""
+        assert not node.evicted and node.backuped
+        trigger = self.components[BASE_COMPONENT_TYPE]
+        self._evict_component_and_detach_lru(
+            node, trigger, target=EvictLayer.DEVICE, tracker=tracker
+        )
+        self._cascade_evict(node, trigger, tracker)
+        self._record_remove_event(node, medium=StorageMedium.GPU)
 
-
-
-
-
-
+        # after device eviction, insert aux components into host LRU.
+        self._for_each_component_lru(
+            node, UnifiedLRUList.insert_mru, target=EvictLayer.HOST, skip_existing=True
+        )
+        self._update_evictable_leaf_sets(node.parent)
+```
+下面详细查看下`_cascade_evict(...)`的具体定义，其中该函数，会根据每个节点的eviction_priority来，如果是非叶子结点，直接按照Full > SWA > mamba的顺序，假设某个KV被evict，低于其优先级的KV会被一起evict；对于叶子结点，由于需要删除整个叶子结点，因此如果trigger是SWA，只要Full没锁，也会级联evict full；注意，在级联的最后，判断如果component_type是Full，再把value置为None，因为evict SWA的时候需要Full；
 
