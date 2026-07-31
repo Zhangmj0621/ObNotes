@@ -93,8 +93,147 @@ Partial emulation：虽然走多项式估计能够节约MUFU指令，然而，�
 直接切换rescale为如下的公式，仅当rescale差距超过256的时候，才进行更新一次，不然就延迟更新，能够大幅度减少rescaling操作。在实际运行中，为了避免warp内的threads多样性，不让他们走不同分支，只要32个threads有任何一个线程需要resacle，整个warp的的所有线程都执行rescale。
 ![[Pasted image 20260728172427.png]]
 ### 3.2 Attention backward pass
+==不用特别关注，毕竟推理没有backward pass==
 #### 3.2.1 Feeds and Speeds
 和forward pass类似，我们首先提供指导关于我们的kernel设计和优化的motivation，基于具体计算出的tensor core, smem访问和指数单元的所需时间；
 * MMA计算：backward pass需要5个MMA操作，每个MMA包括一个MxN的matrix，一个Mxd的matrix和一个dxN的matrix，需要2MND的浮点数操作，总共10MND的浮点数操作，因此需要时间为 10MND / 8192 cycles。
-* SMEM流量：其中三个操作= KQ⊤, dP⊤ = VdO⊤, and dQ = dSK是shared-shared操作，而剩下两个操作dV = P⊤dO and dK = dS⊤Q是Tensor-shared操作，因而Shared memory总带宽为 (4md+3ND+MN) / 64 cycles，同时，考虑到算法还有额外把立即数梯度dDS (MxN)写到Shared memory，
-* 指数单元
+* SMEM流量：其中三个操作= KQ⊤, dP⊤ = VdO⊤, and dQ = dSK是shared-shared操作，而剩下两个操作dV = P⊤dO and dK = dS⊤Q是Tensor-shared操作，因而Shared memory总带宽为 (4md+3ND+MN) / 64 cycles，同时，考虑到算法还有额外把立即数梯度dDS (MxN)以BF16写到Shared memory，dQ (Mxd)要以FP32写到shared memory，随后利用TMA读回来做reduction，总共8MD的SMEM read/write，因此总时间为 (4MD+3ND+MN)/64 + MN/64 + Md/16 cycles。
+* 指数单元：仍然为MN/16 cycles。
+![[Pasted image 20260728180443.png]]
+可以看到，在M=N=d=128的场景下，SMEM流量占据3328个cycle，超过了MMA计算时间 (2560 cycles)和指数计算单元 (1024 cycles)，显示SMEM读写成为主要的bottleneck。
+#### 3.2.2 New pipeline to overlap matmul and softmax
+skip
+#### 3.2.3 2-CTA backward pass
+需要特意提一下2-CTA backward pass，他能够降低一半的SMEM流量，
+#### 3.2.4 Deterministic backward pass
+skip
+### 3.3 Scheduling
+这一节非常重要，本质是回答一个问题：==不同的attention tile按照顺序分配给SM==，fa4直接借鉴经典的longest-processing-time-first (LPT)调度的思路；
+一个worktile通常由坐标表示：$(mblock,\ head,\ batch)$，其中mblock代表分配给CTA/block的那个Query tile，head代表attention head，batch代表batch item，在该CTA中，固定处理一块Q_j，和所有的K算。
+而这天然带来了一个问题，即不同的worktile的运行时间是不一样的：
+* 普通non-causal、固定长度attention，每个Q tile遍历所有的K/V tile，因此，所有worktile的mainloop长度基本一致
+* causal attention：假设Q和K block size相同，第m个query block只能看到他之前的key blocks，因此$T(m)\propto m+1$，假设共有8个query blocks，那么就有如下的表格
+
+**mblock** | **需要处理的 KV blocks**  | **相对工作量** |
+| -----: | ---------------- | ----: |
+|      0 | $(K_0)$            |     1 |
+|      1 | $(K_0,K_1)$        |     2 |
+|      2 | $(K_0,K_1,K_2)$    |     3 |
+|      … | …                |     … |
+|      7 | $(K_0,\ldots,K_7)$ |     8 |
+所以causal attention的tile计算量天然呈三角形，对于varlen attention，情况更复杂：
+* 不同batch的Q长度不同
+* 不同batch的KV长度不同
+* 有的batch是短prefill
+* 有的batch是长context decode
+* causal和non-causal可能混合
+* 不同tile的inner-loop次数差异很大
+因此，这本质上是一个**load-imbalanced scheduling problem**。假设有4个SM，每个SM不断领取新tile，假设有4个SM，任务耗时分别为$1,2,3,4,5,6,7,8$，如果按照从短到长分发，那就是
+```py title=""
+第一轮：
+SM0: 1
+SM1: 2
+SM2: 3
+SM3: 4
+
+第二轮：
+SM0: +5 → 总计 6
+SM1: +6 → 总计 8
+SM2: +7 → 总计 10
+SM3: +8 → 总计 12
+```
+总执行时间由最慢的SM决定，也即12s，在最后的尾部，大量的SM已经没事可做，==这就是tail effect/wave quantization tail==；
+使用LPT能够先执行长任务，然后按需给不同的SM分配新任务，这样能保证先开始执行的SM拿到的是更慢的tile计算目标，然而，简单的LPT排序并不优，核心是他可能会影响**L2 cache locality**。不同的tile可能复用相同的K/V数据，调度顺序如果过于随机，虽然SM load balance了，但却可能破坏KV的L2 cache reuse，因此，真正的优化目标应该是$\boxed{\text{减少 SM 尾部不均衡}+\text{保持 K/V 的 L2 locality}}$.
+不同batch的KV实际上是完全不同的数据，这取决于sequence具体的token，==这也会导致随意的交错可能会导致L2 cache miss==，一个示意图如下：
+```py title=""
+处理 batch 0 的 tile
+→ K0/V0 进入 L2
+
+立即处理 batch 1
+→ K1/V1 进入 L2，挤掉部分 K0/V0
+
+又回到 batch 0
+→ 之前的 K0/V0 可能已经被驱逐
+```
+如果全局LPT把不同batch按任务长度任意混合，那么几乎无法有效复用L2中的KV，因此论文采用了一个naive但有效的策略，即$\boxed{\text{batch 始终作为最外层维度}}$，也就是大致如下的伪代码：
+```py title=""
+for batch in batches:
+    process_tiles_of_this_batch()
+```
+这样能够在处理一个batch时持续使用它的KV，之后再切换到下一个batch。
+对MHA model来说，每个head有自己的KV，如果一个batch有很多heads，**所有heads的KV总容量可能大于L2**，因此如果按照如下的格式来进行计算的话，最早加载的KV head仍然会被后面的heads挤出L2：
+```py title=""
+mblock 15:
+    head 0, head 1, ..., head 31
+
+mblock 14:
+    head 0, head 1, ..., head 31
+```
+当运行到mblock14时，head0的KV可能早就已经被别的heads给驱逐了，因此，fa4没有一次性处理全部heads，而是把heads划分为若干section：
+```py title=""
+section 0: heads 0–7
+section 1: heads 8–15
+section 2: heads 16–23
+section 3: heads 24–31
+```
+目标是让 $W_{\text{heads in section}} \lesssim C_{\text{usable L2}}$，这样同一个section内的KV数据，在处理多个mblocks时仍然有机会留在L2；
+最终使用的循环结构大致如下伪代码：
+```py title=""
+for batch in batches:                         # 最外层
+    for head_section in head_sections:
+        for mblock in reversed(mblocks):      # LPT：长 tile 先
+            for head in head_section:         # section 内 heads
+                run_tile(batch, head, mblock)
+```
+类似的遍历顺序如下：
+```py title=""
+batch 0, section 0:
+    mblock 3: head 0, head 1
+    mblock 2: head 0, head 1
+    mblock 1: head 0, head 1
+    mblock 0: head 0, head 1
+
+batch 0, section 1:
+    mblock 3: head 2, head 3
+    mblock 2: head 2, head 3
+    mblock 1: head 2, head 3
+    mblock 0: head 2, head 3
+
+然后才进入 batch 1
+```
+这个顺序兼顾了load balance，同一个head，mblock从大到小执行，且同时考虑了L2 locality，不随意跨batch，不执行过多的heads导致不同的mblock无法复用KV，因此他不是纯LPT，而是$\boxed{\text{cache-aware hierarchical LPT}}$。
+对于MQA和GQA，需要做特殊的处理，因为，不同的q head会共享完全相同的k head，按照上面的逻辑，每个head各算各的，在MQA/GQA场景，显然应该先遍历同一个KV head对应的所有相关的query head，概念上的顺序类似，这样能保证，同一个KV head能够尽可能的被共享，这也是为什么MQA8 (4%-8%)的scheduling收益比MQA8 (7%-14%)的收益更大。
+```py title=""
+for batch in batches:
+    for kv_head_section in kv_head_sections:
+        for mblock in reversed(mblocks):
+            for kv_head in kv_head_section:
+                for q_head in query_heads_sharing(kv_head):
+                    run_tile(batch, q_head, kv_head, mblock)
+```
+对于variable-length attention，不同的batch item长度不同，例如常见的一些case如下：
+![[Pasted image 20260729192619.png]]
+默认情况下，attention metadata中的batch顺序可能就是用户传入的顺序，这个顺序与计算量没有任何的关系，例如可能出现
+```py title=""
+很多短 prefill 先执行
+最后才执行几个长 context decode
+```
+这与casual mblock从短到长的问题相同，长问题被留到最后，产生严重长尾；
+论文针对varlen实施LPT的做法是**先启动一个preprocessing kernel**，这个预处理kernel根据每个batch的
+* query length；
+* KV length；
+* causal状态；
+* 每个worktile的最大mainloop长度；
+估算该batch中最重的worktile的执行时间，可以具体抽象为$w_b = \max_{m\in\text{tiles of batch }b} T(b,m)$，然后按照$w_{b_0}\ge w_{b_1}\ge\cdots$对batch进行排序，这里论文特意写的是maximum per-worktile execution time，而不是简单按照总token数或总FLOPS排序。原先是调度单元是tile，kernel的拖尾往往由最慢的tile决定。
+当然，嗯的不可能真的把Q/K/V tensor在内存中重新排序，因为那会产生巨大的搬运开销，所以preprocessing kernel只会生成一个permutation：
+```py title=""
+virtual batch index → actual batch index
+```
+例如原始batch顺序是：0，1，2，3，根据预计任务长度排序后是1，2，3，0，那么就生成如下的映射：
+```py title=""
+virtual 0 → actual 1
+virtual 1 → actual 2
+virtual 2 → actual 3
+virtual 3 → actual 0
+```
+attention kernel调度时遍历的 是virtual batch 0, 1, 2, 3，真正读取数据时，通过映射找到actual batch 1, 2, 3, 0；
