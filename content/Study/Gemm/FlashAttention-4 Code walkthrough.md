@@ -76,4 +76,7 @@ kv_stage = 1 意味着零重叠:MMA 每算一块都要干等 TMA——"流水级
 | 剩给 K/V     | 224 − 96 = 128 KB |
 | 槽位(按 48KB) | 128 ÷ 48 = 2 个    |
 
-2 已经能活,但这里还叠了第二层抠门(:361-376,就是之前提过的 uneven_kv_槽位装的东西固定——0、2 号槽装的总是 48KB 的 K,1 号槽装的总是 32KB 的V,那就不必每个槽都开 48KB。==按"大-小-大"排列,平均 stride 取 (48+32)/2 = 40KB,3 个槽只要 120KB ≤ 128KB==,塞下了。代价是寻址不再均匀:1 号槽的真实地址相对"基址 + 1×40KB"差了 ±8KB,要按相位补偿——这就是 offset_kv_smem(:3111)和 uneven,也是为什么 load_KV 里 stage 0 要额外等 stage 1 排空(:3085-3089,因为0 号 K 的 48KB 会侵入原本 1 号的地盘)。注意，对于128的head_dim和is_split KV而言，
+2 已经能活,但这里还叠了第二层抠门(:361-376,就是之前提过的 uneven_kv_槽位装的东西固定——0、2 号槽装的总是 48KB 的 K,1 号槽装的总是 32KB 的V,那就不必每个槽都开 48KB。==按"大-小-大"排列,平均 stride 取 (48+32)/2 = 40KB,3 个槽只要 120KB ≤ 128KB==,塞下了。代价是寻址不再均匀:1 号槽的真实地址相对"基址 + 1×40KB"差了 ±8KB,要按相位补偿——这就是 offset_kv_smem(:3111)和 uneven,也是为什么 load_KV 里 stage 0 要额外等 stage 1 排空(:3085-3089,因为0 号 K 的 48KB 会侵入原本 1 号的地盘)。注意，对于128的head_dim和is_split KV而言，split kv后，O会从bf16变成fp32，因而会占据两倍的SMEM space，因而，为了保证掩盖KV的TMA搬运时间，仍然需要开启overlap_sO_sQ，其中虽然O在TMEM中是FP32，但正常从寄存器写会SMEM的时候会转为BF16；
+随后，根据具体是否开启varlen_q, 是否persistent kernel，是否有causal mask等来初始化Scheduler，如果都不是，直接fallback成普通的SingleTileScheduler，这个Scheduler本质就是做映射，即每个Block获取哪个Tile进行计算；
+![[Pasted image 20260811210227.png]]
+随后，判断是否可以开启use_tma_Q，随后判断，是否能用TMA搬数据，如果不能， 则设置搬数据的warp为14和15，不再保留empty warp
