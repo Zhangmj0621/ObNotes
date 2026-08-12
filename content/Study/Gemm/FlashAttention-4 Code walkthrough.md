@@ -80,3 +80,12 @@ kv_stage = 1 意味着零重叠:MMA 每算一块都要干等 TMA——"流水级
 随后，根据具体是否开启varlen_q, 是否persistent kernel，是否有causal mask等来初始化Scheduler，如果都不是，直接fallback成普通的SingleTileScheduler，这个Scheduler本质就是做映射，即每个Block获取哪个Tile进行计算；
 ![[Pasted image 20260811210227.png]]
 随后，判断是否可以开启use_tma_Q，随后判断，是否能用TMA搬数据，如果不能， 则设置搬数据的warp为14和15，不再保留empty warp
+![[Pasted image 20260811210618.png]]
+注意，其中存在use_correction_warps_for_epi，如果不能用TMA搬运O到SMEM中，那么单warp太慢，此时直接用correction_warp来搬运；
+随后，来具体分配TMEM中各个组件的偏移，其中就和paper里所述的一样，低0位开始放S->P low，128位开始放S->P high，256位和384位放O low和O high；
+![[Pasted image 20260811211459.png]]
+随后根据具体的调参config获取最优的寄存器分配；
+### Kernel
+随后具体查看核心的GPU device kernel的实现，其中输入如下：
+![[Pasted image 20260811213335.png]]
+其中，kernel核心实现5类型warp，load warp/MMA warp/Softmax Warp/Correction Warp/Epilogue warp的pipeline。
