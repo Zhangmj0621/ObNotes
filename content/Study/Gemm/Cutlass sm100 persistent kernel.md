@@ -8,3 +8,4 @@ sm100的persistent kernel在cutlass的文件sm100_gemm_tma_warpspecialized.hpp�
 ![[Pasted image 20260917150316.png]]
 不同的warp间通过pipeline进行mbarrier同步，具体而言的pipeline如下：
 ![[Pasted image 20260917150331.png]]
+其中，详细逐段分析代码如下：
