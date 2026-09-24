@@ -1,2 +1,3 @@
 # 概述
 本文档详解MegaMoE的具体代码逻辑和细节，重点和Comet的实现进行对比，其中，尤其关注下怎么在两个计算GEMM间迁移，以及怎么处理tile-level的computation和token-level的communication的mismatch；
+# Code walkthrough
