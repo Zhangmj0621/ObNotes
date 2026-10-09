@@ -3,3 +3,4 @@
 # Code walkthrough
 由于k3的attn_res采用了复杂的num_valid_blocks机制，因而，该attn_res实则也是一个复杂的persistent kernel，其中，同时把rmsnorm给fuse到了其中；
 具体而言，attn_res fused kernel采用persistent kernel的方法；
+具体而言
